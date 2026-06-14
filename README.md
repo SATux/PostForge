@@ -138,6 +138,12 @@ Look for the `instagram_business_account` object inside your Page entry:
 3. Enter your **Instagram User ID** (or click Auto-detect)
 4. Click **Connect & Fetch Data**
 
+After a successful connection PostForge automatically:
+- Saves your token and User ID to `.env` so the sidebar pre-fills on the next visit
+- Caches your post data to `.postforge_cache.parquet` so the dashboard loads instantly on reload
+
+To pull fresh data click **🔄 Fetch Latest** in the sidebar. To switch accounts click **🚪 Log Out**.
+
 ---
 
 ## Token Refresh
@@ -155,6 +161,11 @@ Long-Lived tokens expire after **60 days**. When yours expires, repeat Step 5 �
 | `[10] Permission denied` | Missing permission on token | Re-generate token with all three permissions |
 | Auto-detect returns nothing | IG account not linked to a Facebook Page | Complete Step 2 |
 | Insights show all zeros | Personal account, or posts older than 2 years | Switch to Business/Creator |
+| Dashboard loads stale data | Cached parquet is outdated | Click **🔄 Fetch Latest** in the sidebar |
+
+### Debug logging
+
+Set `DEBUG = True` near the top of `app.py` to write full API request/response details to `/tmp/postforge_debug.log`. Set it back to `False` for normal use.
 
 ---
 
