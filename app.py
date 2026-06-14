@@ -1,6 +1,6 @@
 """
 PostForge — Instagram Analytics & Optimization Tool
-Uses instagrapi (private mobile API) — just your username + password.
+Uses the official Meta Instagram Graph API (v22.0).
 """
 
 import datetime
@@ -13,22 +13,17 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 from dotenv import load_dotenv
-from instagrapi import Client
-from instagrapi.exceptions import (
-    BadPassword,
-    ChallengeRequired,
-    LoginRequired,
-    TwoFactorRequired,
-)
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 load_dotenv()
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-SESSION_FILE = ".ig_session.json"
-INSIGHT_SLEEP = 0.5   # seconds between insight calls to avoid rate limits
+GRAPH_API_VERSION = "v22.0"
+GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+INSIGHT_SLEEP = 0.5   # seconds between per-post insight calls
 
 EMOJI_RE = re.compile("[\U00010000-\U0010ffff]", flags=re.UNICODE)
 CTA_KEYWORDS = [
@@ -37,114 +32,157 @@ CTA_KEYWORDS = [
     "grab", "get", "discover", "learn", "watch", "join", "sign up",
 ]
 
-# instagrapi media_type int → readable label
-MEDIA_TYPE_MAP = {1: "IMAGE", 2: "VIDEO", 8: "CAROUSEL_ALBUM"}
-
 _vader = SentimentIntensityAnalyzer()
 
 
-# ── Auth / API Layer ───────────────────────────────────────────────────────────
-def _new_client() -> Client:
-    cl = Client()
-    if os.path.exists(SESSION_FILE):
-        try:
-            cl.load_settings(SESSION_FILE)
-        except Exception:
-            pass
-    return cl
-
-
-def _verification_hint(cl: Client) -> str:
-    """Human-readable hint about what kind of verification code Instagram wants."""
-    info = cl.last_json.get("two_factor_info", {}) if isinstance(cl.last_json, dict) else {}
-    if info.get("totp_two_factor_on"):
-        return "Open your **authenticator app** and enter the 6-digit code."
-    if info.get("sms_two_factor_on"):
-        phone = info.get("obfuscated_phone_number", "your registered phone number")
-        return f"Instagram sent a code via **SMS to {phone}**. Enter it below."
-    # No traditional 2FA — Instagram is verifying the new device via email/SMS.
-    return (
-        "Instagram has detected a new device and sent a **one-time verification code** "
-        "to your registered email or phone. Check your messages and enter it below. "
-        "This only happens once — the session is saved afterwards."
+# ── Graph API Layer ────────────────────────────────────────────────────────────
+def _graph_get(path: str, token: str, **params) -> dict:
+    """Make a Graph API GET request. Raises RuntimeError on API error."""
+    r = requests.get(
+        f"{GRAPH_BASE}/{path.lstrip('/')}",
+        params={"access_token": token, **params},
+        timeout=30,
     )
+    data = r.json()
+    if "error" in data:
+        err = data["error"]
+        raise RuntimeError(f"[{err.get('code', '?')}] {err.get('message', 'Unknown API error')}")
+    return data
 
 
-def fetch_profile(cl: Client) -> dict:
-    info = cl.account_info()
+def find_ig_user_id(token: str) -> str | None:
+    """
+    Auto-detect the Instagram Business/Creator User ID from a user access token
+    by looking at the connected Facebook Pages.
+    """
+    try:
+        pages = _graph_get("me/accounts", token, fields="instagram_business_account")
+        for page in pages.get("data", []):
+            iba = page.get("instagram_business_account", {})
+            if iba.get("id"):
+                return iba["id"]
+    except Exception:
+        pass
+    return None
+
+
+def fetch_profile(token: str, user_id: str) -> dict:
+    data = _graph_get(
+        user_id,
+        token,
+        fields="id,username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website",
+    )
     return {
-        "user_id": info.pk,
-        "username": info.username,
-        "full_name": info.full_name,
-        "biography": info.biography,
-        "followers_count": info.follower_count,
-        "following_count": info.following_count,
-        "media_count": info.media_count,
-        "profile_picture_url": str(info.profile_pic_url) if info.profile_pic_url else None,
-        "website": str(info.external_url) if info.external_url else None,
+        "user_id": data["id"],
+        "username": data.get("username", ""),
+        "full_name": data.get("name", ""),
+        "biography": data.get("biography", ""),
+        "followers_count": data.get("followers_count", 0),
+        "following_count": data.get("follows_count", 0),
+        "media_count": data.get("media_count", 0),
+        "profile_picture_url": data.get("profile_picture_url"),
+        "website": data.get("website"),
     }
 
 
-def _media_thumb(media) -> str:
-    """Best available image URL for a media object."""
-    if media.thumbnail_url:
-        return str(media.thumbnail_url)
-    if media.video_url:
-        return str(media.video_url)
-    return ""
+def _fetch_post_insights(media_id: str, media_type: str, token: str) -> dict:
+    """Fetch per-post insights. Silently returns {} on any error."""
+    metrics = "reach,saved,shares"
+    if media_type == "VIDEO":
+        metrics += ",video_views"
+    try:
+        ins = _graph_get(f"{media_id}/insights", token, metric=metrics)
+        return {
+            item["name"]: item["values"][0]["value"]
+            for item in ins.get("data", [])
+            if item.get("values")
+        }
+    except Exception:
+        return {}
 
 
-def fetch_all_media(cl: Client, user_id: int, limit: int, progress_bar, status_text) -> tuple[list, dict]:
+def fetch_all_media(
+    token: str, user_id: str, limit: int, progress_bar, status_text
+) -> tuple[list[dict], dict]:
     """
-    Returns (medias, insights_map).
-    insights_map: {media.pk → dict} — only populated for business/creator accounts.
+    Cursor-paginate through media and fetch per-post insights.
+    Returns (medias, insights_map) where medias is a list of Graph API dicts.
     """
+    fields = (
+        "id,caption,media_type,media_url,thumbnail_url,timestamp,"
+        "like_count,comments_count,permalink,"
+        "children{id,media_type,media_url}"
+    )
+
     status_text.text(f"Fetching your last {limit} posts…")
-    progress_bar.progress(0.1)
-    medias = cl.user_medias(user_id, amount=limit)
+    progress_bar.progress(0.05)
+
+    medias: list[dict] = []
+    next_url: str | None = f"{GRAPH_BASE}/{user_id}/media"
+    # First request passes params; subsequent requests use the full `next` URL
+    req_params: dict | None = {"fields": fields, "limit": min(limit, 50), "access_token": token}
+
+    while next_url and len(medias) < limit:
+        if req_params:
+            r = requests.get(next_url, params=req_params, timeout=30).json()
+            req_params = None
+        else:
+            r = requests.get(next_url, timeout=30).json()
+
+        if "error" in r:
+            err = r["error"]
+            st.warning(f"Media fetch stopped: [{err.get('code')}] {err.get('message')}")
+            break
+
+        batch = r.get("data", [])
+        if not batch:
+            break
+
+        medias.extend(batch)
+        progress_bar.progress(min(0.38, 0.05 + 0.33 * len(medias) / max(limit, 1)))
+        next_url = r.get("paging", {}).get("next")
+
+    medias = medias[:limit]
     progress_bar.progress(0.4)
 
     insights_map: dict[str, dict] = {}
     total = len(medias)
-    for i, media in enumerate(medias):
+    for i, m in enumerate(medias):
         progress_bar.progress(0.4 + 0.6 * (i / max(total, 1)))
         status_text.text(f"Fetching insights for post {i + 1}/{total}…")
-        try:
-            raw = cl.insights_media_id(media.pk)
-            insights_map[str(media.pk)] = raw if isinstance(raw, dict) else {}
-        except Exception:
-            insights_map[str(media.pk)] = {}
+        insights_map[m["id"]] = _fetch_post_insights(m["id"], m.get("media_type", "IMAGE"), token)
         time.sleep(INSIGHT_SLEEP)
 
     return medias, insights_map
 
 
 # ── Feature Engineering ────────────────────────────────────────────────────────
-def engineer_features(medias: list, insights_map: dict, followers: int) -> pd.DataFrame:
+def engineer_features(medias: list[dict], insights_map: dict, followers: int) -> pd.DataFrame:
     rows = []
     for m in medias:
-        caption = m.caption_text or ""
-        ts = pd.to_datetime(m.taken_at)
-        ins = insights_map.get(str(m.pk), {})
+        caption = m.get("caption", "") or ""
+        ts = pd.to_datetime(m["timestamp"])
+        ins = insights_map.get(m["id"], {})
+        media_type = m.get("media_type", "IMAGE")  # "IMAGE", "VIDEO", "CAROUSEL_ALBUM"
 
-        likes = m.like_count or 0
-        comments = m.comment_count or 0
-        shares = ins.get("shares") or 0
-        saves = ins.get("saved") or 0      # instagrapi uses "saved" not "saves"
-        reach = ins.get("reach") or 0
-        views = m.view_count or ins.get("video_view_count") or 0
+        likes = m.get("like_count", 0) or 0
+        comments = m.get("comments_count", 0) or 0
+        shares = ins.get("shares", 0) or 0
+        saves = ins.get("saved", 0) or 0
+        reach = ins.get("reach", 0) or 0
+        views = ins.get("video_views", 0) or 0
+
         raw = likes + comments + shares + saves
         denom = max(reach if reach > 0 else followers, 1)
 
         hashtags = re.findall(r"#\w+", caption.lower())
         vs = _vader.polarity_scores(caption)
-        media_type_str = MEDIA_TYPE_MAP.get(m.media_type, "IMAGE")
-        permalink = f"https://www.instagram.com/p/{m.code}/"
+        children = m.get("children", {}).get("data", [])
 
         rows.append(
             {
-                "id": str(m.pk),
-                "permalink": permalink,
+                "id": m["id"],
+                "permalink": m.get("permalink", ""),
                 "timestamp": ts,
                 "hour": ts.hour,
                 "weekday": ts.day_of_week,
@@ -152,10 +190,10 @@ def engineer_features(medias: list, insights_map: dict, followers: int) -> pd.Da
                 "is_weekend": ts.day_of_week >= 5,
                 "month": ts.month,
                 "year": ts.year,
-                "media_type": media_type_str,
-                "is_carousel": m.media_type == 8,
-                "num_slides": len(m.resources) if m.resources else 1,
-                "thumbnail_url": _media_thumb(m),
+                "media_type": media_type,
+                "is_carousel": media_type == "CAROUSEL_ALBUM",
+                "num_slides": len(children) if children else 1,
+                "thumbnail_url": m.get("thumbnail_url") or m.get("media_url") or "",
                 "caption": caption,
                 "caption_length": len(caption),
                 "word_count": len(caption.split()) if caption else 0,
@@ -807,9 +845,9 @@ def render_audience_insights(profile: dict, df: pd.DataFrame) -> None:
     _dark_chart(fig2)
 
     st.info(
-        "Deep audience demographics (age, gender, location) require the official "
-        "Meta Graph API with a verified Business account. The data above is derived "
-        "from your own post history."
+        "Deep audience demographics (age, gender, location) require advanced Graph API "
+        "permissions (`instagram_manage_insights`) and a verified Business account. "
+        "The data above is derived from your own post history."
     )
 
 
@@ -943,8 +981,8 @@ def _generate_pdf(df: pd.DataFrame, profile: dict) -> bytes:
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
-def render_sidebar() -> tuple[str, str, int, bool, bool, str]:
-    """Returns (username, password, limit, connect_clicked, verify_clicked, code)."""
+def render_sidebar() -> tuple[str, str, int, bool, bool]:
+    """Returns (token, user_id, limit, connect_clicked, find_id_clicked)."""
     st.sidebar.markdown(
         """
 <div style="text-align:center;padding:16px 0;">
@@ -976,41 +1014,38 @@ def render_sidebar() -> tuple[str, str, int, bool, bool, str]:
                 st.rerun()
         with c2:
             if st.sidebar.button("🚪 Log Out", use_container_width=True):
-                for k in ("df", "profile", "ig_client", "awaiting_2fa", "pending_username", "pending_password"):
+                for k in ("df", "profile", "token", "user_id"):
                     st.session_state.pop(k, None)
-                if os.path.exists(SESSION_FILE):
-                    os.remove(SESSION_FILE)
                 st.rerun()
         st.sidebar.markdown("---")
 
-    st.sidebar.markdown("### 🔐 Connect Your Account")
-    username = st.sidebar.text_input("Instagram Username", key="sb_username")
-    password = st.sidebar.text_input("Instagram Password", type="password", key="sb_password")
+    st.sidebar.markdown("### 🔐 Connect via Meta API")
+    token = st.sidebar.text_input(
+        "Long-Lived Access Token",
+        type="password",
+        key="sb_token",
+        help="60-day token from the Meta Graph API Explorer. See README for setup steps.",
+    )
+    user_id = st.sidebar.text_input(
+        "Instagram User ID",
+        key="sb_user_id",
+        help="Your numeric IG Business/Creator account ID. Click 'Auto-detect' to find it.",
+        placeholder="e.g. 17841400000000001",
+    )
+    find_id = st.sidebar.button(
+        "🔍 Auto-detect User ID",
+        use_container_width=True,
+        help="Looks up your IG User ID from the token via your connected Facebook Page.",
+    )
     limit = st.sidebar.slider("Posts to analyze", 50, 300, 150, 25)
+    connect = st.sidebar.button(
+        "🔗 Connect & Fetch Data",
+        use_container_width=True,
+        type="primary",
+        disabled=not (token and user_id),
+    )
 
-    connect = st.sidebar.button("🔗 Connect & Fetch Data", use_container_width=True, type="primary")
-
-    verify = False
-    retry_challenge = False
-    code = ""
-
-    if st.session_state.get("awaiting_2fa"):
-        hint = st.session_state.get("2fa_hint", "Enter the verification code Instagram sent you.")
-        st.sidebar.markdown("---")
-        st.sidebar.markdown(f"**Verification required**\n\n{hint}")
-        code = st.sidebar.text_input("Verification code", max_chars=8, key="sb_2fa_code")
-        verify = st.sidebar.button("✅ Submit code", use_container_width=True, type="primary")
-
-    if st.session_state.get("awaiting_challenge"):
-        st.sidebar.markdown("---")
-        st.sidebar.markdown(
-            "**App approval required**\n\n"
-            "Open your **Instagram app** — you should see a notification asking "
-            "_'Was this you?'_ Tap **It was me**, then click the button below."
-        )
-        retry_challenge = st.sidebar.button("🔄 I've approved it — continue", use_container_width=True, type="primary")
-
-    return username, password, limit, connect, verify, code, retry_challenge
+    return token, user_id, limit, connect, find_id
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1023,93 +1058,56 @@ def main() -> None:
     )
     apply_theme()
 
-    username, password, limit, connect, verify, code, retry_challenge = render_sidebar()
+    token, user_id, limit, connect, find_id = render_sidebar()
 
-    def _clear_auth_state() -> None:
-        for k in ("awaiting_2fa", "awaiting_challenge", "2fa_hint",
-                  "pending_client", "pending_username", "pending_password"):
-            st.session_state.pop(k, None)
-
-    def _finish_login(cl: Client, uname: str) -> None:
-        """After a successful login: save session, fetch profile + posts."""
-        cl.dump_settings(SESSION_FILE)
-        st.session_state["ig_client"] = cl
-        _clear_auth_state()
-
-        profile = fetch_profile(cl)
-        st.session_state["profile"] = profile
-
-        progress = st.progress(0.1)
-        status = st.empty()
-        medias, insights_map = fetch_all_media(cl, profile["user_id"], limit, progress, status)
-        progress.progress(1.0)
-        status.empty()
-
-        if medias:
-            df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
-            st.session_state["df"] = df
-            st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
-        else:
-            st.warning("No posts found for this account.")
-
-    def _do_login(uname: str, pwd: str, otp: str = "") -> None:
-        # Reuse the in-progress client if we're retrying with a verification code.
-        # This is critical — Instagram ties the code to the original login attempt's
-        # session state, so a fresh Client will always reject it.
-        cl: Client = st.session_state.pop("pending_client", None) or _new_client()
-        try:
-            cl.login(uname, pwd, verification_code=otp)
-            _finish_login(cl, uname)
-
-        except TwoFactorRequired:
-            hint = _verification_hint(cl)
-            st.session_state["awaiting_2fa"] = True
-            st.session_state["2fa_hint"] = hint
-            st.session_state["pending_client"] = cl   # must reuse this exact instance
-            st.session_state["pending_username"] = uname
-            st.session_state["pending_password"] = pwd
+    # Auto-detect User ID from token
+    if find_id and token:
+        with st.spinner("Looking up your Instagram User ID…"):
+            found = find_ig_user_id(token)
+        if found:
+            st.session_state["sb_user_id"] = found
+            st.sidebar.success(f"Found: **{found}** — now click Connect.")
             st.rerun()
+        else:
+            st.sidebar.error(
+                "Could not auto-detect. Make sure your token has "
+                "`pages_read_engagement` permission and is linked to a Facebook Page "
+                "with a connected Instagram Business or Creator account."
+            )
 
-        except ChallengeRequired:
-            last = cl.last_json if isinstance(cl.last_json, dict) else {}
-            api_path = last.get("challenge", {}).get("api_path", "")
-            if "auth_platform" in api_path or "challenge" in api_path:
-                # Instagram sent an "approve on device" push notification
-                st.session_state["awaiting_challenge"] = True
-                st.session_state["pending_username"] = uname
-                st.session_state["pending_password"] = pwd
-                # Don't store the old client — after app approval a fresh login works
-                st.rerun()
-            else:
-                st.error(
-                    "Instagram requires extra verification. "
-                    "Log in at instagram.com in a browser to clear the challenge, then retry here."
+    # Connect + fetch data
+    if connect and token and user_id:
+        user_id = user_id.strip()
+        with st.spinner("Validating credentials…"):
+            try:
+                profile = fetch_profile(token, user_id)
+            except RuntimeError as e:
+                st.error(f"Connection failed: {e}")
+                st.info(
+                    "Common causes:\n"
+                    "- Token has expired (60-day limit) — generate a new one\n"
+                    "- Wrong User ID — use the Auto-detect button\n"
+                    "- Missing `instagram_basic` permission on your token"
                 )
+                profile = None
 
-        except BadPassword:
-            st.error("Incorrect password. Please check and try again.")
-        except LoginRequired:
-            _clear_auth_state()
-            st.error("Session expired — please log in again.")
-        except Exception as e:
-            st.error(f"Login failed: {e}")
+        if profile:
+            st.session_state["token"] = token
+            st.session_state["user_id"] = user_id
+            st.session_state["profile"] = profile
 
-    if connect and username and password:
-        with st.spinner("Connecting to Instagram…"):
-            _do_login(username, password)
+            progress = st.progress(0.0)
+            status = st.empty()
+            medias, insights_map = fetch_all_media(token, user_id, limit, progress, status)
+            progress.progress(1.0)
+            status.empty()
 
-    if verify and code:
-        uname = st.session_state.get("pending_username", username)
-        pwd = st.session_state.get("pending_password", password)
-        with st.spinner("Verifying code…"):
-            _do_login(uname, pwd, otp=code)
-
-    if retry_challenge:
-        uname = st.session_state.get("pending_username", username)
-        pwd = st.session_state.get("pending_password", password)
-        _clear_auth_state()
-        with st.spinner("Retrying after app approval…"):
-            _do_login(uname, pwd)
+            if medias:
+                df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
+                st.session_state["df"] = df
+                st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
+            else:
+                st.warning("No posts found for this account.")
 
     df: pd.DataFrame | None = st.session_state.get("df")
     profile: dict = st.session_state.get("profile", {})
@@ -1117,13 +1115,13 @@ def main() -> None:
     if df is None or df.empty:
         st.markdown(
             """
-<div style="text-align:center;padding:80px 20px;">
+<div style="text-align:center;padding:60px 20px 20px;">
     <div style="font-size:4rem;">🔥</div>
     <h1 style="background:linear-gradient(90deg,#833AB4,#FD1D1D,#FCAF45);
         -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
         Welcome to PostForge
     </h1>
-    <p style="color:#a0a0c0;font-size:1.1rem;max-width:520px;margin:0 auto;">
+    <p style="color:#a0a0c0;font-size:1.1rem;max-width:540px;margin:0 auto 32px;">
         Connect your Instagram account to unlock deep analytics, discover what content
         performs best, and get a personalized, data-driven growth plan.
     </p>
@@ -1131,6 +1129,53 @@ def main() -> None:
 """,
             unsafe_allow_html=True,
         )
+
+        st.markdown("---")
+        st.markdown("### Quick Setup Guide")
+        with st.expander("Step 1 — Switch to a Professional Account", expanded=False):
+            st.markdown(
+                "In the Instagram app: **Settings → Account → Switch to Professional Account**.  \n"
+                "Choose **Creator** or **Business**."
+            )
+        with st.expander("Step 2 — Link Instagram to a Facebook Page", expanded=False):
+            st.markdown(
+                "In the Instagram app: **Settings → Account → Sharing to other apps → Facebook**.  \n"
+                "Connect to an existing Facebook Page (or create one — it can be a placeholder)."
+            )
+        with st.expander("Step 3 — Create a Meta Developer App", expanded=False):
+            st.markdown(
+                "1. Go to **developers.facebook.com** → **My Apps** → **Create App**\n"
+                "2. Choose **Business** as the app type\n"
+                "3. Under **Products**, add **Instagram Graph API**"
+            )
+        with st.expander("Step 4 — Get a Long-Lived Access Token", expanded=False):
+            st.markdown(
+                "**4a. Short-lived token** — open the [Graph API Explorer]"
+                "(https://developers.facebook.com/tools/explorer/), select your app, "
+                "add permissions `instagram_basic`, `instagram_manage_insights`, "
+                "`pages_read_engagement`, then click **Generate Access Token**.\n\n"
+                "**4b. Extend to 60 days** — make this API call (replace placeholders):\n"
+                "```\n"
+                f"GET https://graph.facebook.com/{GRAPH_API_VERSION}/oauth/access_token\n"
+                "  ?grant_type=fb_exchange_token\n"
+                "  &client_id=YOUR_APP_ID\n"
+                "  &client_secret=YOUR_APP_SECRET\n"
+                "  &fb_exchange_token=SHORT_LIVED_TOKEN\n"
+                "```\n"
+                "Copy the `access_token` from the JSON response into the sidebar."
+            )
+        with st.expander("Step 5 — Get Your Instagram User ID", expanded=False):
+            st.markdown(
+                "Paste your token in the sidebar and click **Auto-detect User ID** — PostForge "
+                "will find it automatically via your connected Facebook Page.\n\n"
+                "Or find it manually:\n"
+                "```\n"
+                f"GET https://graph.facebook.com/{GRAPH_API_VERSION}/me/accounts\n"
+                "  ?fields=instagram_business_account\n"
+                "  &access_token=YOUR_TOKEN\n"
+                "```\n"
+                "Look for `instagram_business_account.id` in the response."
+            )
         return
 
     tabs = st.tabs(
