@@ -50,6 +50,21 @@ def _graph_get(path: str, token: str, **params) -> dict:
     return data
 
 
+def _graph_get_fields(path: str, token: str, fields: list[str]) -> dict:
+    """Request a set of fields, automatically dropping any the API rejects."""
+    remaining = list(fields)
+    while remaining:
+        try:
+            return _graph_get(path, token, fields=",".join(remaining))
+        except RuntimeError as e:
+            m = re.search(r"nonexisting field \((\w+)\)", str(e))
+            if m:
+                remaining = [f for f in remaining if f != m.group(1)]
+            else:
+                raise
+    return {}
+
+
 def find_ig_user_id(token: str) -> str | None:
     """
     Auto-detect the Instagram Business/Creator User ID from a user access token
@@ -67,31 +82,24 @@ def find_ig_user_id(token: str) -> str | None:
 
 
 def fetch_profile(token: str, user_id: str) -> dict:
-    # Core fields are always available; optional fields may not be present on all
-    # account types or API versions and cause a hard [100] error if requested together.
-    core = _graph_get(
+    data = _graph_get_fields(
         user_id, token,
-        fields="id,username,name,followers_count,follows_count,media_count",
+        fields=[
+            "id", "username", "name", "biography",
+            "followers_count", "follows_count", "media_count",
+            "profile_picture_url", "website",
+        ],
     )
-    optional: dict = {}
-    try:
-        optional = _graph_get(
-            user_id, token,
-            fields="biography,profile_picture_url,website",
-        )
-    except RuntimeError:
-        pass
-
     return {
-        "user_id": core["id"],
-        "username": core.get("username", ""),
-        "full_name": core.get("name", ""),
-        "biography": optional.get("biography", ""),
-        "followers_count": core.get("followers_count", 0),
-        "following_count": core.get("follows_count", 0),
-        "media_count": core.get("media_count", 0),
-        "profile_picture_url": optional.get("profile_picture_url"),
-        "website": optional.get("website"),
+        "user_id": data.get("id", user_id),
+        "username": data.get("username", ""),
+        "full_name": data.get("name", ""),
+        "biography": data.get("biography", ""),
+        "followers_count": data.get("followers_count", 0),
+        "following_count": data.get("follows_count", 0),
+        "media_count": data.get("media_count", 0),
+        "profile_picture_url": data.get("profile_picture_url"),
+        "website": data.get("website"),
     }
 
 
