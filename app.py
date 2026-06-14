@@ -67,21 +67,31 @@ def find_ig_user_id(token: str) -> str | None:
 
 
 def fetch_profile(token: str, user_id: str) -> dict:
-    data = _graph_get(
-        user_id,
-        token,
-        fields="id,username,name,biography,followers_count,follows_count,media_count,profile_picture_url,website",
+    # Core fields are always available; optional fields may not be present on all
+    # account types or API versions and cause a hard [100] error if requested together.
+    core = _graph_get(
+        user_id, token,
+        fields="id,username,name,followers_count,follows_count,media_count",
     )
+    optional: dict = {}
+    try:
+        optional = _graph_get(
+            user_id, token,
+            fields="biography,profile_picture_url,website",
+        )
+    except RuntimeError:
+        pass
+
     return {
-        "user_id": data["id"],
-        "username": data.get("username", ""),
-        "full_name": data.get("name", ""),
-        "biography": data.get("biography", ""),
-        "followers_count": data.get("followers_count", 0),
-        "following_count": data.get("follows_count", 0),
-        "media_count": data.get("media_count", 0),
-        "profile_picture_url": data.get("profile_picture_url"),
-        "website": data.get("website"),
+        "user_id": core["id"],
+        "username": core.get("username", ""),
+        "full_name": core.get("name", ""),
+        "biography": optional.get("biography", ""),
+        "followers_count": core.get("followers_count", 0),
+        "following_count": core.get("follows_count", 0),
+        "media_count": core.get("media_count", 0),
+        "profile_picture_url": optional.get("profile_picture_url"),
+        "website": optional.get("website"),
     }
 
 
