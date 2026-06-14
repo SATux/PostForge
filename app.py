@@ -65,20 +65,47 @@ def _graph_get_fields(path: str, token: str, fields: list[str]) -> dict:
     return {}
 
 
-def find_ig_user_id(token: str) -> str | None:
+def find_ig_accounts(token: str) -> tuple[list[dict], str]:
     """
-    Auto-detect the Instagram Business/Creator User ID from a user access token
-    by looking at the connected Facebook Pages.
+    Find all Instagram Business/Creator accounts reachable from the token.
+    Returns (accounts, diagnostic) where accounts is a list of dicts with
+    keys ig_user_id, ig_username, page_name, and diagnostic is a human-readable
+    string explaining what was found / what went wrong.
     """
+    accounts: list[dict] = []
     try:
-        pages = _graph_get("me/accounts", token, fields="instagram_business_account")
-        for page in pages.get("data", []):
+        data = _graph_get(
+            "me/accounts", token,
+            fields="id,name,instagram_business_account{id,username,name}",
+        )
+        pages = data.get("data", [])
+        if not pages:
+            return [], (
+                "Your token is valid but no Facebook Pages were found. "
+                "Your Facebook account must manage at least one Page that has "
+                "an Instagram Business or Creator account connected to it."
+            )
+        page_names = [p.get("name", p.get("id", "?")) for p in pages]
+        for page in pages:
             iba = page.get("instagram_business_account", {})
             if iba.get("id"):
-                return iba["id"]
-    except Exception:
-        pass
-    return None
+                accounts.append({
+                    "ig_user_id": iba["id"],
+                    "ig_username": iba.get("username", ""),
+                    "ig_name": iba.get("name", ""),
+                    "page_name": page.get("name", ""),
+                })
+        if not accounts:
+            names = ", ".join(f'"{n}"' for n in page_names[:5])
+            return [], (
+                f"Found {len(pages)} Facebook Page(s) ({names}) but none had an "
+                "Instagram Business or Creator account connected.\n\n"
+                "**To fix:** In the Instagram app go to **Settings → Account → "
+                "Sharing to other apps → Facebook** and connect the Page."
+            )
+        return accounts, ""
+    except RuntimeError as e:
+        return [], f"API error while looking up pages: {e}"
 
 
 def fetch_profile(token: str, user_id: str) -> dict:
@@ -1097,18 +1124,26 @@ def main() -> None:
 
     # Auto-detect User ID from token
     if find_id and token:
-        with st.spinner("Looking up your Instagram User ID…"):
-            found = find_ig_user_id(token)
-        if found:
-            st.session_state["sb_user_id"] = found
-            st.sidebar.success(f"Found: **{found}** — now click Connect.")
+        with st.spinner("Looking up connected Instagram accounts…"):
+            accounts, diagnostic = find_ig_accounts(token)
+
+        if len(accounts) == 1:
+            acc = accounts[0]
+            st.session_state["sb_user_id"] = acc["ig_user_id"]
+            label = f"@{acc['ig_username']}" if acc["ig_username"] else acc["ig_user_id"]
+            st.sidebar.success(f"Found **{label}** (ID: `{acc['ig_user_id']}`) — now click Connect.")
             st.rerun()
+        elif len(accounts) > 1:
+            st.sidebar.info(f"Found {len(accounts)} linked Instagram accounts. Click one to use it:")
+            for acc in accounts:
+                label = f"@{acc['ig_username']}" if acc["ig_username"] else acc["ig_user_id"]
+                if acc["page_name"]:
+                    label += f" (via Page: {acc['page_name']})"
+                if st.sidebar.button(label, key=f"pick_{acc['ig_user_id']}"):
+                    st.session_state["sb_user_id"] = acc["ig_user_id"]
+                    st.rerun()
         else:
-            st.sidebar.error(
-                "Could not auto-detect. Make sure your token has "
-                "`pages_read_engagement` permission and is linked to a Facebook Page "
-                "with a connected Instagram Business or Creator account."
-            )
+            st.sidebar.error(diagnostic or "No Instagram accounts found.")
 
     # Connect + fetch data
     if connect and token and user_id:
