@@ -38,12 +38,16 @@ _vader = SentimentIntensityAnalyzer()
 # ── Graph API Layer ────────────────────────────────────────────────────────────
 def _graph_get(path: str, token: str, **params) -> dict:
     """Make a Graph API GET request. Raises RuntimeError on API error."""
-    r = requests.get(
-        f"{GRAPH_BASE}/{path.lstrip('/')}",
-        params={"access_token": token, **params},
-        timeout=30,
-    )
+    url = f"{GRAPH_BASE}/{path.lstrip('/')}"
+    # Build a printable URL with the token redacted
+    safe_params = {k: ("***" if k == "access_token" else v) for k, v in params.items()}
+    safe_qs = "&".join(f"{k}={v}" for k, v in safe_params.items())
+    print(f"[Graph API] GET {url}?{safe_qs}", flush=True)
+
+    r = requests.get(url, params={"access_token": token, **params}, timeout=30)
     data = r.json()
+    print(f"[Graph API] {r.status_code} → {data}", flush=True)
+
     if "error" in data:
         err = data["error"]
         raise RuntimeError(f"[{err.get('code', '?')}] {err.get('message', 'Unknown API error')}")
