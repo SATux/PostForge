@@ -1,6 +1,6 @@
 """
 PostForge — Instagram Analytics & Optimization Tool
-Uses the official Meta Instagram Graph API (v22.0).
+Uses the official Meta Instagram Graph API (v25.0).
 """
 
 import datetime
@@ -21,7 +21,7 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 load_dotenv()
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-GRAPH_API_VERSION = "v22.0"
+GRAPH_API_VERSION = "v25.0"
 GRAPH_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 INSIGHT_SLEEP = 0.5   # seconds between per-post insight calls
 

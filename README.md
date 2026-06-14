@@ -75,7 +75,7 @@ You need your **App ID** and **App Secret**, found at:
 Make this GET request in your browser or with curl (replace the placeholders):
 
 ```
-https://graph.facebook.com/v22.0/oauth/access_token
+https://graph.facebook.com/v25.0/oauth/access_token
   ?grant_type=fb_exchange_token
   &client_id=YOUR_APP_ID
   &client_secret=YOUR_APP_SECRET
@@ -84,7 +84,7 @@ https://graph.facebook.com/v22.0/oauth/access_token
 
 **Example with curl:**
 ```bash
-curl "https://graph.facebook.com/v22.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_TOKEN"
+curl "https://graph.facebook.com/v25.0/oauth/access_token?grant_type=fb_exchange_token&client_id=APP_ID&client_secret=APP_SECRET&fb_exchange_token=SHORT_TOKEN"
 ```
 
 The response looks like:
@@ -111,7 +111,7 @@ In PostForge, paste your token and click **Auto-detect User ID**. PostForge will
 Make this API call with your long-lived token:
 
 ```
-https://graph.facebook.com/v22.0/me/accounts
+https://graph.facebook.com/v25.0/me/accounts
   ?fields=name,instagram_business_account
   &access_token=YOUR_LONG_LIVED_TOKEN
 ```
