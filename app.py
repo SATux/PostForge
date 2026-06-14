@@ -4,6 +4,7 @@ Uses the official Meta Instagram Graph API (v25.0).
 """
 
 import datetime
+import logging
 import os
 import re
 import time
@@ -19,6 +20,17 @@ from dotenv import load_dotenv
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 load_dotenv()
+
+# ── Debug logging ──────────────────────────────────────────────────────────────
+LOG_FILE = os.path.join(os.path.dirname(__file__), "postforge_debug.log")
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.DEBUG,
+    format="%(asctime)s  %(message)s",
+    datefmt="%H:%M:%S",
+    filemode="a",
+)
+log = logging.getLogger("postforge")
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GRAPH_API_VERSION = "v25.0"
@@ -39,14 +51,13 @@ _vader = SentimentIntensityAnalyzer()
 def _graph_get(path: str, token: str, **params) -> dict:
     """Make a Graph API GET request. Raises RuntimeError on API error."""
     url = f"{GRAPH_BASE}/{path.lstrip('/')}"
-    # Build a printable URL with the token redacted
     safe_params = {k: ("***" if k == "access_token" else v) for k, v in params.items()}
     safe_qs = "&".join(f"{k}={v}" for k, v in safe_params.items())
-    print(f"[Graph API] GET {url}?{safe_qs}", flush=True)
+    log.debug("GET %s?%s", url, safe_qs)
 
     r = requests.get(url, params={"access_token": token, **params}, timeout=30)
     data = r.json()
-    print(f"[Graph API] {r.status_code} → {data}", flush=True)
+    log.debug("%s → %s", r.status_code, data)
 
     if "error" in data:
         err = data["error"]

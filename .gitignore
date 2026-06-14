@@ -1,4 +1,5 @@
 CLAUDE.md
 .venv/
+postforge_debug.log
 __pycache__/
 *.pyc
