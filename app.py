@@ -23,9 +23,10 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 load_dotenv()
 
 # ── Debug logging ──────────────────────────────────────────────────────────────
+DEBUG = False  # set True to write API call details to LOG_FILE
 LOG_FILE = "/tmp/postforge_debug.log"
 log = logging.getLogger("postforge")
-log.setLevel(logging.DEBUG)
+log.setLevel(logging.DEBUG if DEBUG else logging.WARNING)
 log.propagate = False  # don't bubble up to root — keeps Streamlit noise out
 if not log.handlers:
     _fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
@@ -540,7 +541,7 @@ def render_overview(df: pd.DataFrame, profile: dict) -> None:
             trend, x="timestamp", y=["engagement_rate", "7-post avg"],
             title="Engagement Rate Over Time",
             labels={"value": "ER %", "timestamp": "", "variable": ""},
-            color_discrete_map={"engagement_rate": "#833AB450", "7-post avg": "#FCAF45"},
+            color_discrete_map={"engagement_rate": "rgba(131,58,180,0.31)", "7-post avg": "#FCAF45"},
             template="plotly_dark",
         )
         fig.update_layout(legend=dict(orientation="h", y=-0.2))
@@ -1186,6 +1187,8 @@ def render_sidebar() -> tuple[str, str, int, bool, bool]:
     limit = 150
     connect = False
     find_id = False
+    token = st.session_state.get("token", "")
+    user_id = st.session_state.get("user_id", "")
 
     if profile:
         st.sidebar.markdown("---")
