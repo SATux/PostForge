@@ -90,6 +90,14 @@ def fetch_profile(token: str, user_id: str) -> dict:
             "profile_picture_url", "website",
         ],
     )
+    # `username` only exists on Instagram nodes. If it's missing the ID is a
+    # Facebook User/Page ID, not an Instagram Business/Creator account ID.
+    if not data.get("username"):
+        raise RuntimeError(
+            "The User ID you entered does not belong to an Instagram Business or Creator account. "
+            "Make sure you are using the **Instagram User ID** (not a Facebook User or Page ID). "
+            "Click **Auto-detect User ID** in the sidebar to find the correct value."
+        )
     return {
         "user_id": data.get("id", user_id),
         "username": data.get("username", ""),
@@ -149,8 +157,17 @@ def fetch_all_media(
 
         if "error" in r:
             err = r["error"]
-            st.warning(f"Media fetch stopped: [{err.get('code')}] {err.get('message')}")
-            break
+            msg = err.get("message", "")
+            if "nonexisting field" in msg and "media" in msg:
+                raise RuntimeError(
+                    "Cannot access posts for this account. "
+                    "This usually means the User ID is a Facebook Page ID rather than an "
+                    "Instagram Business/Creator User ID — use the **Auto-detect User ID** "
+                    "button to find the correct value. Also confirm your token includes the "
+                    "`instagram_basic` permission."
+                )
+            raise RuntimeError(f"[{err.get('code')}] {msg}")
+
 
         batch = r.get("data", [])
         if not batch:
@@ -1116,16 +1133,21 @@ def main() -> None:
 
             progress = st.progress(0.0)
             status = st.empty()
-            medias, insights_map = fetch_all_media(token, user_id, limit, progress, status)
-            progress.progress(1.0)
-            status.empty()
+            try:
+                medias, insights_map = fetch_all_media(token, user_id, limit, progress, status)
+            except RuntimeError as e:
+                progress.empty()
+                status.empty()
+                st.session_state.pop("profile", None)
+                st.error(str(e))
+                medias = []
 
             if medias:
+                progress.progress(1.0)
+                status.empty()
                 df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
                 st.session_state["df"] = df
                 st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
-            else:
-                st.warning("No posts found for this account.")
 
     df: pd.DataFrame | None = st.session_state.get("df")
     profile: dict = st.session_state.get("profile", {})
