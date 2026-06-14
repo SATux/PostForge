@@ -22,15 +22,14 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 load_dotenv()
 
 # ── Debug logging ──────────────────────────────────────────────────────────────
-LOG_FILE = os.path.join(os.path.dirname(__file__), "postforge_debug.log")
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.DEBUG,
-    format="%(asctime)s  %(message)s",
-    datefmt="%H:%M:%S",
-    filemode="a",
-)
+LOG_FILE = "/tmp/postforge_debug.log"
 log = logging.getLogger("postforge")
+log.setLevel(logging.DEBUG)
+log.propagate = False  # don't bubble up to root — keeps Streamlit noise out
+if not log.handlers:
+    _fh = logging.FileHandler(LOG_FILE, mode="a", encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s  %(message)s", datefmt="%H:%M:%S"))
+    log.addHandler(_fh)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 GRAPH_API_VERSION = "v25.0"
