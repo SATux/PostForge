@@ -57,9 +57,24 @@ def _graph_get_fields(path: str, token: str, fields: list[str]) -> dict:
         try:
             return _graph_get(path, token, fields=",".join(remaining))
         except RuntimeError as e:
-            m = re.search(r"nonexisting field \((\w+)\)", str(e))
+            msg = str(e)
+            bad = None
+            # [100] "nonexisting field (fieldname)"
+            m = re.search(r"nonexisting field \((\w+)\)", msg)
             if m:
-                remaining = [f for f in remaining if f != m.group(1)]
+                bad = m.group(1)
+            # [12] "cannot_access_user_USERNAME_field is deprecated"
+            if not bad:
+                m = re.search(r"cannot_access_user_(\w+)_field", msg)
+                if m:
+                    bad = m.group(1)
+            # [12] "FIELDNAME field is deprecated"
+            if not bad:
+                m = re.search(r"\b(\w+) field is deprecated", msg)
+                if m:
+                    bad = m.group(1)
+            if bad:
+                remaining = [f for f in remaining if f != bad]
             else:
                 raise
     return {}
@@ -107,16 +122,7 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str, list[dict]]:
                 except RuntimeError as e:
                     debug_entry["results"][field] = {"error": str(e)}
 
-            # Third attempt: /page-id/instagram_accounts edge
-            if not ig_id:
-                try:
-                    resp = _graph_get(f"{page_id}/instagram_accounts", page_token, fields="id,username")
-                    items = resp.get("data", [])
-                    debug_entry["results"]["instagram_accounts_edge"] = items
-                    if items:
-                        ig_id = items[0].get("id")
-                except RuntimeError as e:
-                    debug_entry["results"]["instagram_accounts_edge"] = {"error": str(e)}
+            debug_entry["results"]["instagram_accounts_edge"] = "skipped (returns Facebook User IDs, not IG Business IDs)"
 
             raw_debug.append(debug_entry)
 
