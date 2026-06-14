@@ -1,4 +1,7 @@
 CLAUDE.md
 .venv/
+.env
+.postforge_cache.parquet
+.postforge_cache_meta.json
 __pycache__/
 *.pyc

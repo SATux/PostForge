@@ -4,6 +4,7 @@ Uses the official Meta Instagram Graph API (v25.0).
 """
 
 import datetime
+import json
 import logging
 import os
 import re
@@ -44,6 +45,46 @@ CTA_KEYWORDS = [
 ]
 
 _vader = SentimentIntensityAnalyzer()
+
+# ── Persistence paths ──────────────────────────────────────────────────────────
+_BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE   = os.path.join(_BASE_DIR, ".env")
+CACHE_DF   = os.path.join(_BASE_DIR, ".postforge_cache.parquet")
+CACHE_META = os.path.join(_BASE_DIR, ".postforge_cache_meta.json")
+
+
+def _save_credentials(token: str, user_id: str) -> None:
+    from dotenv import set_key
+    set_key(ENV_FILE, "POSTFORGE_TOKEN", token)
+    set_key(ENV_FILE, "POSTFORGE_USER_ID", user_id)
+
+
+def _save_cache(df: pd.DataFrame, profile: dict) -> None:
+    df.to_parquet(CACHE_DF, index=False)
+    meta = {**profile, "_cached_at": datetime.datetime.now().isoformat()}
+    with open(CACHE_META, "w") as f:
+        json.dump(meta, f)
+
+
+def _load_cache() -> tuple[pd.DataFrame | None, dict]:
+    if not (os.path.exists(CACHE_DF) and os.path.exists(CACHE_META)):
+        return None, {}
+    try:
+        df = pd.read_parquet(CACHE_DF)
+        with open(CACHE_META) as f:
+            meta = json.load(f)
+        return df, meta
+    except Exception:
+        return None, {}
+
+
+def _age_str(delta: datetime.timedelta) -> str:
+    s = int(delta.total_seconds())
+    if s < 3600:
+        return f"{s // 60}m ago"
+    if s < 86400:
+        return f"{s // 3600}h ago"
+    return f"{delta.days}d ago"
 
 
 # ── Graph API Layer ────────────────────────────────────────────────────────────
@@ -1142,17 +1183,32 @@ def render_sidebar() -> tuple[str, str, int, bool, bool]:
 
     profile = st.session_state.get("profile")
 
+    limit = 150
+    connect = False
+    find_id = False
+
     if profile:
         st.sidebar.markdown("---")
         st.sidebar.markdown(f"**@{profile.get('username', '')}**")
-        st.sidebar.caption(
+        cached_at = profile.get("_cached_at")
+        followers_line = (
             f"👥 {_fmt(profile.get('followers_count', 0))} followers · "
             f"📸 {profile.get('media_count', 0)} posts"
         )
+        if cached_at:
+            try:
+                delta = datetime.datetime.now() - datetime.datetime.fromisoformat(cached_at)
+                followers_line += f" · 📦 {_age_str(delta)}"
+            except Exception:
+                pass
+        st.sidebar.caption(followers_line)
+
+        limit = st.sidebar.slider("Posts to fetch", 50, 300, 150, 25, key="sl_limit")
         c1, c2 = st.sidebar.columns(2)
         with c1:
-            if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
-                st.session_state.pop("df", None)
+            if st.sidebar.button("🔄 Fetch Latest", use_container_width=True):
+                st.session_state["_do_refresh"] = True
+                st.session_state["_refresh_limit"] = limit
                 st.rerun()
         with c2:
             if st.sidebar.button("🚪 Log Out", use_container_width=True):
@@ -1161,31 +1217,32 @@ def render_sidebar() -> tuple[str, str, int, bool, bool]:
                 st.rerun()
         st.sidebar.markdown("---")
 
-    st.sidebar.markdown("### 🔐 Connect via Meta API")
-    token = st.sidebar.text_input(
-        "Long-Lived Access Token",
-        type="password",
-        key="sb_token",
-        help="60-day token from the Meta Graph API Explorer. See README for setup steps.",
-    )
-    user_id = st.sidebar.text_input(
-        "Instagram User ID",
-        key="sb_user_id",
-        help="Your numeric IG Business/Creator account ID. Click 'Auto-detect' to find it.",
-        placeholder="e.g. 17841400000000001",
-    )
-    find_id = st.sidebar.button(
-        "🔍 Auto-detect User ID",
-        use_container_width=True,
-        help="Looks up your IG User ID from the token via your connected Facebook Page.",
-    )
-    limit = st.sidebar.slider("Posts to analyze", 50, 300, 150, 25)
-    connect = st.sidebar.button(
-        "🔗 Connect & Fetch Data",
-        use_container_width=True,
-        type="primary",
-        disabled=not (token and user_id),
-    )
+    else:
+        st.sidebar.markdown("### 🔐 Connect via Meta API")
+        token = st.sidebar.text_input(
+            "Long-Lived Access Token",
+            type="password",
+            key="sb_token",
+            help="60-day token from the Meta Graph API Explorer. See README for setup steps.",
+        )
+        user_id = st.sidebar.text_input(
+            "Instagram User ID",
+            key="sb_user_id",
+            help="Your numeric IG Business/Creator account ID. Click 'Auto-detect' to find it.",
+            placeholder="e.g. 17841400000000001",
+        )
+        find_id = st.sidebar.button(
+            "🔍 Auto-detect User ID",
+            use_container_width=True,
+            help="Looks up your IG User ID from the token via your connected Facebook Page.",
+        )
+        limit = st.sidebar.slider("Posts to analyze", 50, 300, 150, 25, key="sl_limit")
+        connect = st.sidebar.button(
+            "🔗 Connect & Fetch Data",
+            use_container_width=True,
+            type="primary",
+            disabled=not (token and user_id),
+        )
 
     return token, user_id, limit, connect, find_id
 
@@ -1200,7 +1257,31 @@ def main() -> None:
     )
     apply_theme()
 
+    # Pre-fill sidebar inputs from saved credentials (first load only)
+    for _key, _env in [("sb_token", "POSTFORGE_TOKEN"), ("sb_user_id", "POSTFORGE_USER_ID")]:
+        if _key not in st.session_state:
+            _val = os.getenv(_env, "")
+            if _val:
+                st.session_state[_key] = _val
+
+    # Load cached data from disk on first visit (avoids re-fetching on page reload)
+    if "df" not in st.session_state:
+        _cached_df, _cached_meta = _load_cache()
+        if _cached_df is not None and not _cached_df.empty:
+            st.session_state["df"] = _cached_df
+            st.session_state["profile"] = _cached_meta
+            st.session_state.setdefault("token", os.getenv("POSTFORGE_TOKEN", ""))
+            st.session_state.setdefault("user_id", os.getenv("POSTFORGE_USER_ID", ""))
+
     token, user_id, limit, connect, find_id = render_sidebar()
+
+    # "Fetch Latest" button sets this flag; re-use saved credentials to re-fetch
+    if st.session_state.pop("_do_refresh", False):
+        token   = st.session_state.get("token") or os.getenv("POSTFORGE_TOKEN", "")
+        user_id = st.session_state.get("user_id") or os.getenv("POSTFORGE_USER_ID", "")
+        limit   = st.session_state.pop("_refresh_limit", limit)
+        if token and user_id:
+            connect = True
 
     # Auto-detect User ID from token
     if find_id and token:
@@ -1265,6 +1346,8 @@ def main() -> None:
                 status.empty()
                 df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
                 st.session_state["df"] = df
+                _save_credentials(token, user_id)
+                _save_cache(df, profile)
                 st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
 
     df: pd.DataFrame | None = st.session_state.get("df")
