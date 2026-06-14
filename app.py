@@ -65,19 +65,18 @@ def _graph_get_fields(path: str, token: str, fields: list[str]) -> dict:
     return {}
 
 
-def find_ig_accounts(token: str) -> tuple[list[dict], str]:
+def find_ig_accounts(token: str) -> tuple[list[dict], str, list[dict]]:
     """
     Find all Instagram Business/Creator accounts reachable from the token.
-    Returns (accounts, diagnostic) where accounts is a list of dicts with
-    keys ig_user_id, ig_username, page_name, and diagnostic is a human-readable
-    string explaining what was found / what went wrong.
-
-    Key detail: instagram_business_account must be fetched using the Page's own
-    Access Token, not the User Access Token — meta/accounts returns both.
+    Returns (accounts, diagnostic, raw_debug) where:
+      - accounts: list of dicts with ig_user_id, ig_username, page_name
+      - diagnostic: human-readable failure reason (empty on success)
+      - raw_debug: raw per-page API responses for debugging
     """
     accounts: list[dict] = []
+    raw_debug: list[dict] = []
+
     try:
-        # include access_token so we can re-request with the Page token below
         data = _graph_get("me/accounts", token, fields="id,name,access_token")
         pages = data.get("data", [])
 
@@ -86,36 +85,40 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str]:
                 "Your token is valid but **no Facebook Pages** were returned. "
                 "The Facebook account you used to generate this token must manage "
                 "at least one Page.\n\n"
-                "Check at **facebook.com/pages** that you can see your Page, then "
-                "regenerate the token from the same Facebook account."
-            )
-
-        page_names = [p.get("name", p.get("id", "?")) for p in pages]
+                "Check **facebook.com/pages**, then regenerate the token from that "
+                "same Facebook account."
+            ), []
 
         for page in pages:
             page_id = page["id"]
             page_name = page.get("name", page_id)
-            # Use the Page Access Token — this is required for instagram_business_account
             page_token = page.get("access_token") or token
 
+            debug_entry: dict = {"page_id": page_id, "page_name": page_name, "results": {}}
             ig_id = None
 
-            # Primary: instagram_business_account (Business + Creator accounts)
-            try:
-                pd_ = _graph_get(page_id, page_token, fields="instagram_business_account")
-                raw = pd_.get("instagram_business_account")
-                ig_id = raw.get("id") if isinstance(raw, dict) else None
-            except Exception:
-                pass
+            for field in ("instagram_business_account", "connected_instagram_account"):
+                try:
+                    resp = _graph_get(page_id, page_token, fields=field)
+                    raw = resp.get(field)
+                    debug_entry["results"][field] = raw
+                    if isinstance(raw, dict) and raw.get("id") and not ig_id:
+                        ig_id = raw["id"]
+                except RuntimeError as e:
+                    debug_entry["results"][field] = {"error": str(e)}
 
-            # Fallback: connected_instagram_account (catches some Creator setups)
+            # Third attempt: /page-id/instagram_accounts edge
             if not ig_id:
                 try:
-                    pd_ = _graph_get(page_id, page_token, fields="connected_instagram_account")
-                    raw = pd_.get("connected_instagram_account")
-                    ig_id = raw.get("id") if isinstance(raw, dict) else None
-                except Exception:
-                    pass
+                    resp = _graph_get(f"{page_id}/instagram_accounts", page_token, fields="id,username")
+                    items = resp.get("data", [])
+                    debug_entry["results"]["instagram_accounts_edge"] = items
+                    if items:
+                        ig_id = items[0].get("id")
+                except RuntimeError as e:
+                    debug_entry["results"]["instagram_accounts_edge"] = {"error": str(e)}
+
+            raw_debug.append(debug_entry)
 
             if not ig_id:
                 continue
@@ -133,25 +136,21 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str]:
             })
 
         if not accounts:
-            names = ", ".join(f'**{n}**' for n in page_names[:5])
+            page_names = ", ".join(f'**{p["page_name"]}**' for p in raw_debug)
             return [], (
-                f"Found {len(pages)} Facebook Page(s) ({names}) but could not find "
-                "a linked Instagram account via either `instagram_business_account` "
-                "or `connected_instagram_account`.\n\n"
-                "**Steps to fix:**\n"
-                "1. In Instagram app: **Settings → Account → Switch to Professional Account** "
-                "(Creator or Business)\n"
-                "2. In Instagram app: **Settings → Account → Sharing to other apps → Facebook** "
-                "— link to your Page\n"
-                "3. Confirm in **Meta Business Suite** (business.facebook.com) → "
-                "**Settings → Instagram accounts** that your account is listed\n"
-                "4. Regenerate your token with `instagram_basic` and `pages_read_engagement` checked"
-            )
+                f"Found {len(pages)} Facebook Page(s) ({page_names}) but all three "
+                "Instagram lookup methods returned empty. See the **Raw API debug** "
+                "expander below for the exact API responses.\n\n"
+                "**Most common cause:** the Instagram account is not connected at the "
+                "Meta Business Suite level (even if it shows as linked in the Instagram "
+                "app). Go to **business.facebook.com → Settings → Instagram Accounts** "
+                "and add your account there."
+            ), raw_debug
 
-        return accounts, ""
+        return accounts, "", raw_debug
 
     except RuntimeError as e:
-        return [], f"API error: {e}"
+        return [], f"API error: {e}", raw_debug
 
 
 def fetch_profile(token: str, user_id: str) -> dict:
@@ -1171,7 +1170,7 @@ def main() -> None:
     # Auto-detect User ID from token
     if find_id and token:
         with st.spinner("Looking up connected Instagram accounts…"):
-            accounts, diagnostic = find_ig_accounts(token)
+            accounts, diagnostic, raw_debug = find_ig_accounts(token)
 
         if len(accounts) == 1:
             acc = accounts[0]
@@ -1190,6 +1189,9 @@ def main() -> None:
                     st.rerun()
         else:
             st.sidebar.error(diagnostic or "No Instagram accounts found.")
+            if raw_debug:
+                with st.sidebar.expander("🔍 Raw API debug output"):
+                    st.json(raw_debug)
 
     # Connect + fetch data
     if connect and token and user_id:
