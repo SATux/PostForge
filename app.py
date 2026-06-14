@@ -131,8 +131,15 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str, list[dict]]:
                     resp = _graph_get(page_id, page_token, fields=field)
                     raw = resp.get(field)
                     debug_entry["results"][field] = raw
-                    if isinstance(raw, dict) and raw.get("id") and not ig_id:
-                        ig_id = raw["id"]
+                    candidate = raw.get("id") if isinstance(raw, dict) else None
+                    # The API returns the Page's own ID when no IG account is connected —
+                    # reject any candidate that equals the Page ID.
+                    if candidate and candidate != page_id and not ig_id:
+                        ig_id = candidate
+                    elif candidate == page_id:
+                        debug_entry["results"][f"{field}_note"] = (
+                            "returned Page ID — no Instagram account connected at API level"
+                        )
                 except RuntimeError as e:
                     debug_entry["results"][field] = {"error": str(e)}
 
@@ -158,13 +165,21 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str, list[dict]]:
         if not accounts:
             page_names = ", ".join(f'**{p["page_name"]}**' for p in raw_debug)
             return [], (
-                f"Found {len(pages)} Facebook Page(s) ({page_names}) but all three "
-                "Instagram lookup methods returned empty. See the **Raw API debug** "
-                "expander below for the exact API responses.\n\n"
-                "**Most common cause:** the Instagram account is not connected at the "
-                "Meta Business Suite level (even if it shows as linked in the Instagram "
-                "app). Go to **business.facebook.com → Settings → Instagram Accounts** "
-                "and add your account there."
+                f"Found {len(pages)} Facebook Page(s) ({page_names}) but the API returned "
+                "no Instagram account for any of them.\n\n"
+                "**What the log shows:** `instagram_business_account` returned the Page's own "
+                "ID, which means **no Instagram Business/Creator account is connected to this "
+                "Page at the Meta API level** — even if the Instagram app shows a Facebook link.\n\n"
+                "**Two ways to fix this:**\n\n"
+                "**Option A — Connect via Meta Business Suite** (recommended):\n"
+                "1. Go to **business.facebook.com**\n"
+                "2. Settings → Accounts → **Instagram accounts**\n"
+                "3. Click **Add** and log in with your Instagram credentials\n"
+                "4. Restart PostForge and try Auto-detect again\n\n"
+                "**Option B — Enter your Instagram User ID manually:**\n"
+                "Find your numeric IG User ID using a tool like **findmyfbid.in** "
+                "(enter your Instagram profile URL) and paste it directly into the "
+                "Instagram User ID field above."
             ), raw_debug
 
         return accounts, "", raw_debug
