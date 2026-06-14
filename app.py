@@ -54,12 +54,20 @@ def _new_client() -> Client:
     return cl
 
 
-def login_user(username: str, password: str, verification_code: str = "") -> Client:
-    """Log in and return an authenticated Client. Saves session to disk."""
-    cl = _new_client()
-    cl.login(username, password, verification_code=verification_code)
-    cl.dump_settings(SESSION_FILE)
-    return cl
+def _verification_hint(cl: Client) -> str:
+    """Human-readable hint about what kind of verification code Instagram wants."""
+    info = cl.last_json.get("two_factor_info", {}) if isinstance(cl.last_json, dict) else {}
+    if info.get("totp_two_factor_on"):
+        return "Open your **authenticator app** and enter the 6-digit code."
+    if info.get("sms_two_factor_on"):
+        phone = info.get("obfuscated_phone_number", "your registered phone number")
+        return f"Instagram sent a code via **SMS to {phone}**. Enter it below."
+    # No traditional 2FA — Instagram is verifying the new device via email/SMS.
+    return (
+        "Instagram has detected a new device and sent a **one-time verification code** "
+        "to your registered email or phone. Check your messages and enter it below. "
+        "This only happens once — the session is saved afterwards."
+    )
 
 
 def fetch_profile(cl: Client) -> dict:
@@ -982,15 +990,27 @@ def render_sidebar() -> tuple[str, str, int, bool, bool, str]:
 
     connect = st.sidebar.button("🔗 Connect & Fetch Data", use_container_width=True, type="primary")
 
-    # 2FA flow — show code input only when needed
     verify = False
+    retry_challenge = False
     code = ""
-    if st.session_state.get("awaiting_2fa"):
-        st.sidebar.warning("Two-factor authentication required.")
-        code = st.sidebar.text_input("Enter your 6-digit 2FA code", max_chars=6, key="sb_2fa_code")
-        verify = st.sidebar.button("✅ Verify & Continue", use_container_width=True, type="primary")
 
-    return username, password, limit, connect, verify, code
+    if st.session_state.get("awaiting_2fa"):
+        hint = st.session_state.get("2fa_hint", "Enter the verification code Instagram sent you.")
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(f"**Verification required**\n\n{hint}")
+        code = st.sidebar.text_input("Verification code", max_chars=8, key="sb_2fa_code")
+        verify = st.sidebar.button("✅ Submit code", use_container_width=True, type="primary")
+
+    if st.session_state.get("awaiting_challenge"):
+        st.sidebar.markdown("---")
+        st.sidebar.markdown(
+            "**App approval required**\n\n"
+            "Open your **Instagram app** — you should see a notification asking "
+            "_'Was this you?'_ Tap **It was me**, then click the button below."
+        )
+        retry_challenge = st.sidebar.button("🔄 I've approved it — continue", use_container_width=True, type="primary")
+
+    return username, password, limit, connect, verify, code, retry_challenge
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1003,48 +1023,74 @@ def main() -> None:
     )
     apply_theme()
 
-    username, password, limit, connect, verify, code = render_sidebar()
+    username, password, limit, connect, verify, code, retry_challenge = render_sidebar()
+
+    def _clear_auth_state() -> None:
+        for k in ("awaiting_2fa", "awaiting_challenge", "2fa_hint",
+                  "pending_client", "pending_username", "pending_password"):
+            st.session_state.pop(k, None)
+
+    def _finish_login(cl: Client, uname: str) -> None:
+        """After a successful login: save session, fetch profile + posts."""
+        cl.dump_settings(SESSION_FILE)
+        st.session_state["ig_client"] = cl
+        _clear_auth_state()
+
+        profile = fetch_profile(cl)
+        st.session_state["profile"] = profile
+
+        progress = st.progress(0.1)
+        status = st.empty()
+        medias, insights_map = fetch_all_media(cl, profile["user_id"], limit, progress, status)
+        progress.progress(1.0)
+        status.empty()
+
+        if medias:
+            df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
+            st.session_state["df"] = df
+            st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
+        else:
+            st.warning("No posts found for this account.")
 
     def _do_login(uname: str, pwd: str, otp: str = "") -> None:
+        # Reuse the in-progress client if we're retrying with a verification code.
+        # This is critical — Instagram ties the code to the original login attempt's
+        # session state, so a fresh Client will always reject it.
+        cl: Client = st.session_state.pop("pending_client", None) or _new_client()
         try:
-            cl = login_user(uname, pwd, verification_code=otp)
-            st.session_state["ig_client"] = cl
-            st.session_state.pop("awaiting_2fa", None)
-            st.session_state.pop("pending_username", None)
-            st.session_state.pop("pending_password", None)
-
-            profile = fetch_profile(cl)
-            st.session_state["profile"] = profile
-
-            progress = st.progress(0.1)
-            status = st.empty()
-            medias, insights_map = fetch_all_media(
-                cl, profile["user_id"], limit, progress, status
-            )
-            progress.progress(1.0)
-            status.empty()
-
-            if medias:
-                df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
-                st.session_state["df"] = df
-                st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
-            else:
-                st.warning("No posts found for this account.")
+            cl.login(uname, pwd, verification_code=otp)
+            _finish_login(cl, uname)
 
         except TwoFactorRequired:
+            hint = _verification_hint(cl)
             st.session_state["awaiting_2fa"] = True
+            st.session_state["2fa_hint"] = hint
+            st.session_state["pending_client"] = cl   # must reuse this exact instance
             st.session_state["pending_username"] = uname
             st.session_state["pending_password"] = pwd
             st.rerun()
-        except BadPassword:
-            st.error("Incorrect password. Please try again.")
+
         except ChallengeRequired:
-            st.error(
-                "Instagram is asking for a security challenge (SMS or email verification). "
-                "Log in to Instagram in a browser first to clear the challenge, then retry here."
-            )
+            last = cl.last_json if isinstance(cl.last_json, dict) else {}
+            api_path = last.get("challenge", {}).get("api_path", "")
+            if "auth_platform" in api_path or "challenge" in api_path:
+                # Instagram sent an "approve on device" push notification
+                st.session_state["awaiting_challenge"] = True
+                st.session_state["pending_username"] = uname
+                st.session_state["pending_password"] = pwd
+                # Don't store the old client — after app approval a fresh login works
+                st.rerun()
+            else:
+                st.error(
+                    "Instagram requires extra verification. "
+                    "Log in at instagram.com in a browser to clear the challenge, then retry here."
+                )
+
+        except BadPassword:
+            st.error("Incorrect password. Please check and try again.")
         except LoginRequired:
-            st.error("Session expired. Please log in again.")
+            _clear_auth_state()
+            st.error("Session expired — please log in again.")
         except Exception as e:
             st.error(f"Login failed: {e}")
 
@@ -1055,8 +1101,15 @@ def main() -> None:
     if verify and code:
         uname = st.session_state.get("pending_username", username)
         pwd = st.session_state.get("pending_password", password)
-        with st.spinner("Verifying 2FA code…"):
+        with st.spinner("Verifying code…"):
             _do_login(uname, pwd, otp=code)
+
+    if retry_challenge:
+        uname = st.session_state.get("pending_username", username)
+        pwd = st.session_state.get("pending_password", password)
+        _clear_auth_state()
+        with st.spinner("Retrying after app approval…"):
+            _do_login(uname, pwd)
 
     df: pd.DataFrame | None = st.session_state.get("df")
     profile: dict = st.session_state.get("profile", {})
