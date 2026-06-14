@@ -74,38 +74,64 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str]:
     """
     accounts: list[dict] = []
     try:
-        data = _graph_get(
-            "me/accounts", token,
-            fields="id,name,instagram_business_account{id,username,name}",
-        )
+        # Request instagram_business_account as a plain field (no nested sub-fields)
+        # — nested syntax can silently return empty on some token types.
+        data = _graph_get("me/accounts", token, fields="id,name,instagram_business_account")
         pages = data.get("data", [])
+
         if not pages:
             return [], (
-                "Your token is valid but no Facebook Pages were found. "
-                "Your Facebook account must manage at least one Page that has "
-                "an Instagram Business or Creator account connected to it."
+                "Your token is valid but **no Facebook Pages** were returned. "
+                "The Facebook account you used to generate this token must manage "
+                "at least one Page.\n\n"
+                "Check at **facebook.com/pages** that you can see your Page, then "
+                "regenerate the token from the same Facebook account."
             )
+
         page_names = [p.get("name", p.get("id", "?")) for p in pages]
+        pages_without_ig = []
+
         for page in pages:
-            iba = page.get("instagram_business_account", {})
-            if iba.get("id"):
-                accounts.append({
-                    "ig_user_id": iba["id"],
-                    "ig_username": iba.get("username", ""),
-                    "ig_name": iba.get("name", ""),
-                    "page_name": page.get("name", ""),
-                })
+            raw_iba = page.get("instagram_business_account")
+            # raw_iba is either {"id": "..."} or None / missing
+            ig_id = (raw_iba or {}).get("id") if isinstance(raw_iba, dict) else None
+
+            if not ig_id:
+                pages_without_ig.append(page.get("name", page.get("id", "?")))
+                continue
+
+            # Fetch IG username separately to avoid nested field issues
+            try:
+                ig_info = _graph_get_fields(ig_id, token, fields=["username", "name"])
+            except Exception:
+                ig_info = {}
+
+            accounts.append({
+                "ig_user_id": ig_id,
+                "ig_username": ig_info.get("username", ""),
+                "ig_name": ig_info.get("name", ""),
+                "page_name": page.get("name", ""),
+            })
+
         if not accounts:
-            names = ", ".join(f'"{n}"' for n in page_names[:5])
+            names = ", ".join(f'**{n}**' for n in page_names[:5])
             return [], (
-                f"Found {len(pages)} Facebook Page(s) ({names}) but none had an "
-                "Instagram Business or Creator account connected.\n\n"
-                "**To fix:** In the Instagram app go to **Settings → Account → "
-                "Sharing to other apps → Facebook** and connect the Page."
+                f"Found {len(pages)} Facebook Page(s) ({names}) but the "
+                "`instagram_business_account` field was empty for all of them.\n\n"
+                "**Most likely causes:**\n"
+                "1. Your Instagram account is still in **Personal** mode — go to "
+                "Instagram app → **Settings → Account → Switch to Professional Account**\n"
+                "2. The Page–Instagram link is incomplete — open **Meta Business Suite** "
+                "(business.facebook.com), go to **Settings → Instagram accounts** and "
+                "confirm the account appears there\n"
+                "3. Your token is missing `pages_read_engagement` permission — regenerate "
+                "it with that permission checked"
             )
+
         return accounts, ""
+
     except RuntimeError as e:
-        return [], f"API error while looking up pages: {e}"
+        return [], f"API error: {e}"
 
 
 def fetch_profile(token: str, user_id: str) -> dict:
