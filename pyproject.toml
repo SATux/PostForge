@@ -17,6 +17,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "wordcloud>=1.9",
     "matplotlib>=3.9",
+    "instagrapi>=2.10.5",
 ]
 
 [tool.uv]

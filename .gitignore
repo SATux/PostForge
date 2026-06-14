@@ -1,1 +1,5 @@
 CLAUDE.md
+.ig_session.json
+.venv/
+__pycache__/
+*.pyc

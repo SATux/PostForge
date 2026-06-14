@@ -1,10 +1,10 @@
 """
 PostForge — Instagram Analytics & Optimization Tool
-Connects to the official Meta Graph API (v21.0).
+Uses instagrapi (private mobile API) — just your username + password.
 """
 
 import datetime
-import hashlib
+import os
 import re
 import time
 from io import BytesIO
@@ -13,22 +13,22 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import requests
 import streamlit as st
 from dotenv import load_dotenv
+from instagrapi import Client
+from instagrapi.exceptions import (
+    BadPassword,
+    ChallengeRequired,
+    LoginRequired,
+    TwoFactorRequired,
+)
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 load_dotenv()
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-GRAPH_API_BASE = "https://graph.facebook.com/v21.0"
-MEDIA_FIELDS = (
-    "id,caption,media_type,media_url,thumbnail_url,timestamp,"
-    "like_count,comments_count,permalink,shares_count,saved_count,"
-    "children{id,media_type,media_url}"
-)
-INSIGHT_METRICS = "reach,engagement,saves,shares,views"
-RATE_LIMIT_SLEEP = 0.35
+SESSION_FILE = ".ig_session.json"
+INSIGHT_SLEEP = 0.5   # seconds between insight calls to avoid rate limits
 
 EMOJI_RE = re.compile("[\U00010000-\U0010ffff]", flags=re.UNICODE)
 CTA_KEYWORDS = [
@@ -37,128 +37,106 @@ CTA_KEYWORDS = [
     "grab", "get", "discover", "learn", "watch", "join", "sign up",
 ]
 
+# instagrapi media_type int → readable label
+MEDIA_TYPE_MAP = {1: "IMAGE", 2: "VIDEO", 8: "CAROUSEL_ALBUM"}
+
 _vader = SentimentIntensityAnalyzer()
 
 
-# ── API Layer ──────────────────────────────────────────────────────────────────
-def _api_get(endpoint: str, params: dict) -> dict:
-    url = f"{GRAPH_API_BASE}/{endpoint}"
-    r = requests.get(url, params=params, timeout=15)
-    data = r.json()
-    if "error" in data:
-        raise RuntimeError(data["error"].get("message", "Unknown API error"))
-    return data
-
-
-def fetch_profile(token: str, user_id: str) -> dict:
-    return _api_get(
-        user_id,
-        {
-            "fields": "id,username,name,biography,followers_count,media_count,"
-                      "profile_picture_url,website",
-            "access_token": token,
-        },
-    )
-
-
-def _fetch_media_page(token: str, user_id: str, after: str | None, page_size: int) -> dict:
-    params = {"fields": MEDIA_FIELDS, "limit": page_size, "access_token": token}
-    if after:
-        params["after"] = after
-    return _api_get(f"{user_id}/media", params)
-
-
-def _fetch_post_insights(token: str, media_id: str) -> dict:
-    try:
-        data = _api_get(
-            f"{media_id}/insights",
-            {"metric": INSIGHT_METRICS, "access_token": token},
-        )
-        return {item["name"]: item["value"] for item in data.get("data", [])}
-    except Exception:
-        return {}
-
-
-def fetch_account_insights(token: str, user_id: str) -> dict:
-    try:
-        since = int((datetime.datetime.now() - datetime.timedelta(days=30)).timestamp())
-        until = int(datetime.datetime.now().timestamp())
-        return _api_get(
-            f"{user_id}/insights",
-            {
-                "metric": "impressions,reach,profile_views,follower_count",
-                "period": "day",
-                "since": since,
-                "until": until,
-                "access_token": token,
-            },
-        )
-    except Exception:
-        return {}
-
-
-def fetch_all_media(
-    token: str, user_id: str, limit: int,
-    progress_bar, status_text,
-) -> list[dict]:
-    posts: list[dict] = []
-    after = None
-    page = 1
-
-    while len(posts) < limit:
-        batch = min(25, limit - len(posts))
-        status_text.text(f"Fetching media page {page}…")
+# ── Auth / API Layer ───────────────────────────────────────────────────────────
+def _new_client() -> Client:
+    cl = Client()
+    if os.path.exists(SESSION_FILE):
         try:
-            data = _fetch_media_page(token, user_id, after, batch)
-        except RuntimeError as e:
-            st.error(f"Media fetch error: {e}")
-            break
-        items = data.get("data", [])
-        if not items:
-            break
-        posts.extend(items)
-        cursor = data.get("paging", {}).get("cursors", {}).get("after")
-        if not cursor or not data.get("paging", {}).get("next"):
-            break
-        after = cursor
-        page += 1
-        time.sleep(0.1)
+            cl.load_settings(SESSION_FILE)
+        except Exception:
+            pass
+    return cl
 
-    total = len(posts)
-    for i, post in enumerate(posts):
+
+def login_user(username: str, password: str, verification_code: str = "") -> Client:
+    """Log in and return an authenticated Client. Saves session to disk."""
+    cl = _new_client()
+    cl.login(username, password, verification_code=verification_code)
+    cl.dump_settings(SESSION_FILE)
+    return cl
+
+
+def fetch_profile(cl: Client) -> dict:
+    info = cl.account_info()
+    return {
+        "user_id": info.pk,
+        "username": info.username,
+        "full_name": info.full_name,
+        "biography": info.biography,
+        "followers_count": info.follower_count,
+        "following_count": info.following_count,
+        "media_count": info.media_count,
+        "profile_picture_url": str(info.profile_pic_url) if info.profile_pic_url else None,
+        "website": str(info.external_url) if info.external_url else None,
+    }
+
+
+def _media_thumb(media) -> str:
+    """Best available image URL for a media object."""
+    if media.thumbnail_url:
+        return str(media.thumbnail_url)
+    if media.video_url:
+        return str(media.video_url)
+    return ""
+
+
+def fetch_all_media(cl: Client, user_id: int, limit: int, progress_bar, status_text) -> tuple[list, dict]:
+    """
+    Returns (medias, insights_map).
+    insights_map: {media.pk → dict} — only populated for business/creator accounts.
+    """
+    status_text.text(f"Fetching your last {limit} posts…")
+    progress_bar.progress(0.1)
+    medias = cl.user_medias(user_id, amount=limit)
+    progress_bar.progress(0.4)
+
+    insights_map: dict[str, dict] = {}
+    total = len(medias)
+    for i, media in enumerate(medias):
         progress_bar.progress(0.4 + 0.6 * (i / max(total, 1)))
         status_text.text(f"Fetching insights for post {i + 1}/{total}…")
-        post["_insights"] = _fetch_post_insights(token, post["id"])
-        time.sleep(RATE_LIMIT_SLEEP)
+        try:
+            raw = cl.insights_media_id(media.pk)
+            insights_map[str(media.pk)] = raw if isinstance(raw, dict) else {}
+        except Exception:
+            insights_map[str(media.pk)] = {}
+        time.sleep(INSIGHT_SLEEP)
 
-    return posts
+    return medias, insights_map
 
 
 # ── Feature Engineering ────────────────────────────────────────────────────────
-def engineer_features(posts: list[dict], followers: int) -> pd.DataFrame:
+def engineer_features(medias: list, insights_map: dict, followers: int) -> pd.DataFrame:
     rows = []
-    for p in posts:
-        caption = p.get("caption") or ""
-        ts = pd.to_datetime(p.get("timestamp"))
-        ins = p.get("_insights", {})
+    for m in medias:
+        caption = m.caption_text or ""
+        ts = pd.to_datetime(m.taken_at)
+        ins = insights_map.get(str(m.pk), {})
 
-        likes = p.get("like_count") or 0
-        comments = p.get("comments_count") or 0
+        likes = m.like_count or 0
+        comments = m.comment_count or 0
         shares = ins.get("shares") or 0
-        saves = ins.get("saves") or 0
+        saves = ins.get("saved") or 0      # instagrapi uses "saved" not "saves"
         reach = ins.get("reach") or 0
-        views = ins.get("views") or 0
+        views = m.view_count or ins.get("video_view_count") or 0
         raw = likes + comments + shares + saves
         denom = max(reach if reach > 0 else followers, 1)
 
         hashtags = re.findall(r"#\w+", caption.lower())
         vs = _vader.polarity_scores(caption)
-        children = p.get("children", {}).get("data", [])
+        media_type_str = MEDIA_TYPE_MAP.get(m.media_type, "IMAGE")
+        permalink = f"https://www.instagram.com/p/{m.code}/"
 
         rows.append(
             {
-                "id": p.get("id"),
-                "permalink": p.get("permalink"),
+                "id": str(m.pk),
+                "permalink": permalink,
                 "timestamp": ts,
                 "hour": ts.hour,
                 "weekday": ts.day_of_week,
@@ -166,11 +144,10 @@ def engineer_features(posts: list[dict], followers: int) -> pd.DataFrame:
                 "is_weekend": ts.day_of_week >= 5,
                 "month": ts.month,
                 "year": ts.year,
-                "media_type": p.get("media_type", "IMAGE"),
-                "is_carousel": p.get("media_type") == "CAROUSEL_ALBUM",
-                "num_slides": len(children) if children else 1,
-                "media_url": p.get("media_url") or p.get("thumbnail_url"),
-                "thumbnail_url": p.get("thumbnail_url") or p.get("media_url"),
+                "media_type": media_type_str,
+                "is_carousel": m.media_type == 8,
+                "num_slides": len(m.resources) if m.resources else 1,
+                "thumbnail_url": _media_thumb(m),
                 "caption": caption,
                 "caption_length": len(caption),
                 "word_count": len(caption.split()) if caption else 0,
@@ -775,13 +752,15 @@ def render_recommendations(df: pd.DataFrame, profile: dict) -> None:
 
 
 # ── Tab: Audience Insights ─────────────────────────────────────────────────────
-def render_audience_insights(token: str, user_id: str, profile: dict) -> None:
+def render_audience_insights(profile: dict, df: pd.DataFrame) -> None:
     st.markdown('<div class="sec-hdr">👥 Audience Insights</div>', unsafe_allow_html=True)
 
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
         kpi_card("Followers", _fmt(profile.get("followers_count", 0)))
     with c2:
+        kpi_card("Following", _fmt(profile.get("following_count", 0)))
+    with c3:
         kpi_card("Total Posts", _fmt(profile.get("media_count", 0)))
 
     if profile.get("biography"):
@@ -790,29 +769,40 @@ def render_audience_insights(token: str, user_id: str, profile: dict) -> None:
         st.markdown(f"**Website:** {profile['website']}")
 
     st.markdown("---")
-    with st.spinner("Fetching account-level insights…"):
-        data = fetch_account_insights(token, user_id)
-
-    if data and "data" in data:
-        for metric_data in data["data"]:
-            name = metric_data.get("name", "")
-            values = metric_data.get("values", [])
-            if not values:
-                continue
-            mdf = pd.DataFrame(values)
-            mdf["end_time"] = pd.to_datetime(mdf["end_time"])
-            fig = px.line(
-                mdf, x="end_time", y="value",
-                title=name.replace("_", " ").title() + " — Last 30 Days",
-                color_discrete_sequence=["#833AB4"],
-                template="plotly_dark",
-            )
-            _dark_chart(fig)
-    else:
-        st.info(
-            "Account-level insights require a Professional account with `instagram_manage_insights` "
-            "permission. Connect with the correct token scopes to see data here."
+    st.markdown("#### 📅 Posting Activity — Last 90 Days")
+    recent = df[df.timestamp >= pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=90)]
+    if not recent.empty:
+        activity = recent.groupby(recent.timestamp.dt.date).size().reset_index()
+        activity.columns = ["Date", "Posts"]
+        fig = px.bar(
+            activity, x="Date", y="Posts",
+            title="Posts per Day",
+            color_discrete_sequence=["#833AB4"],
+            template="plotly_dark",
         )
+        _dark_chart(fig)
+    else:
+        st.info("No posts in the last 90 days.")
+
+    st.markdown("#### 📆 Posting Frequency by Month")
+    monthly = df.groupby(["year", "month"]).size().reset_index(name="posts")
+    monthly["period"] = monthly.apply(
+        lambda r: f"{int(r.year)}-{int(r.month):02d}", axis=1
+    )
+    fig2 = px.bar(
+        monthly, x="period", y="posts",
+        title="Posts per Month",
+        color_discrete_sequence=["#FD1D1D"],
+        template="plotly_dark",
+        labels={"period": "Month", "posts": "Posts"},
+    )
+    _dark_chart(fig2)
+
+    st.info(
+        "Deep audience demographics (age, gender, location) require the official "
+        "Meta Graph API with a verified Business account. The data above is derived "
+        "from your own post history."
+    )
 
 
 # ── Tab: Export ────────────────────────────────────────────────────────────────
@@ -945,7 +935,8 @@ def _generate_pdf(df: pd.DataFrame, profile: dict) -> bytes:
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
-def render_sidebar() -> tuple[str, str, int, bool]:
+def render_sidebar() -> tuple[str, str, int, bool, bool, str]:
+    """Returns (username, password, limit, connect_clicked, verify_clicked, code)."""
     st.sidebar.markdown(
         """
 <div style="text-align:center;padding:16px 0;">
@@ -961,30 +952,8 @@ def render_sidebar() -> tuple[str, str, int, bool]:
         unsafe_allow_html=True,
     )
 
-    with st.sidebar.expander("🔑 How to get your Access Token & User ID"):
-        st.markdown(
-            """
-**2026 guide:**
-
-1. Switch Instagram account to **Professional** (Creator or Business).
-2. Create a **Meta for Developers** app at [developers.facebook.com](https://developers.facebook.com) → add **Instagram Graph API** product.
-3. Grant permissions: `instagram_basic`, `instagram_manage_insights`, `pages_read_engagement`.
-4. Generate a **User Access Token** in Graph API Explorer, then extend it to a **Long-Lived Token** (60 days) using your App ID + Secret.
-5. Get your **numeric IG User ID**:
-   ```
-   GET /v21.0/me/accounts?access_token=YOUR_TOKEN
-   ```
-   Use the `instagram_business_account.id` value.
-"""
-        )
-
-    st.sidebar.markdown("### 🔐 Connect Your Account")
-    token = st.sidebar.text_input("Long-Lived Access Token", type="password")
-    user_id = st.sidebar.text_input("Instagram User ID (numeric)")
-    limit = st.sidebar.slider("Posts to analyze", 50, 300, 150, 25)
-    connect = st.sidebar.button("🔗 Connect & Fetch Data", use_container_width=True, type="primary")
-
     profile = st.session_state.get("profile")
+
     if profile:
         st.sidebar.markdown("---")
         st.sidebar.markdown(f"**@{profile.get('username', '')}**")
@@ -994,17 +963,34 @@ def render_sidebar() -> tuple[str, str, int, bool]:
         )
         c1, c2 = st.sidebar.columns(2)
         with c1:
-            if st.button("🔄 Refresh", use_container_width=True):
+            if st.sidebar.button("🔄 Refresh Data", use_container_width=True):
                 st.session_state.pop("df", None)
-                st.session_state.pop("profile", None)
                 st.rerun()
         with c2:
-            if st.button("🗑️ Clear", use_container_width=True):
-                for k in ("df", "profile", "token", "user_id"):
+            if st.sidebar.button("🚪 Log Out", use_container_width=True):
+                for k in ("df", "profile", "ig_client", "awaiting_2fa", "pending_username", "pending_password"):
                     st.session_state.pop(k, None)
+                if os.path.exists(SESSION_FILE):
+                    os.remove(SESSION_FILE)
                 st.rerun()
+        st.sidebar.markdown("---")
 
-    return token, user_id, limit, connect
+    st.sidebar.markdown("### 🔐 Connect Your Account")
+    username = st.sidebar.text_input("Instagram Username", key="sb_username")
+    password = st.sidebar.text_input("Instagram Password", type="password", key="sb_password")
+    limit = st.sidebar.slider("Posts to analyze", 50, 300, 150, 25)
+
+    connect = st.sidebar.button("🔗 Connect & Fetch Data", use_container_width=True, type="primary")
+
+    # 2FA flow — show code input only when needed
+    verify = False
+    code = ""
+    if st.session_state.get("awaiting_2fa"):
+        st.sidebar.warning("Two-factor authentication required.")
+        code = st.sidebar.text_input("Enter your 6-digit 2FA code", max_chars=6, key="sb_2fa_code")
+        verify = st.sidebar.button("✅ Verify & Continue", use_container_width=True, type="primary")
+
+    return username, password, limit, connect, verify, code
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -1017,38 +1003,63 @@ def main() -> None:
     )
     apply_theme()
 
-    token, user_id, limit, connect = render_sidebar()
+    username, password, limit, connect, verify, code = render_sidebar()
 
-    if connect:
-        if not token or not user_id:
-            st.warning("Enter both your Access Token and User ID to continue.")
-        else:
-            with st.spinner("Connecting to Instagram…"):
-                try:
-                    profile = fetch_profile(token, user_id)
-                    st.session_state["profile"] = profile
-                    st.session_state["token"] = token
-                    st.session_state["user_id"] = user_id
+    def _do_login(uname: str, pwd: str, otp: str = "") -> None:
+        try:
+            cl = login_user(uname, pwd, verification_code=otp)
+            st.session_state["ig_client"] = cl
+            st.session_state.pop("awaiting_2fa", None)
+            st.session_state.pop("pending_username", None)
+            st.session_state.pop("pending_password", None)
 
-                    progress = st.progress(0.1)
-                    status = st.empty()
-                    posts = fetch_all_media(token, user_id, limit, progress, status)
-                    progress.progress(1.0)
-                    status.empty()
+            profile = fetch_profile(cl)
+            st.session_state["profile"] = profile
 
-                    if posts:
-                        df = engineer_features(posts, profile.get("followers_count", 1))
-                        st.session_state["df"] = df
-                        st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
-                    else:
-                        st.warning("No posts found for this account.")
-                except RuntimeError as e:
-                    st.error(f"Connection failed: {e}")
+            progress = st.progress(0.1)
+            status = st.empty()
+            medias, insights_map = fetch_all_media(
+                cl, profile["user_id"], limit, progress, status
+            )
+            progress.progress(1.0)
+            status.empty()
+
+            if medias:
+                df = engineer_features(medias, insights_map, profile.get("followers_count", 1))
+                st.session_state["df"] = df
+                st.success(f"✅ Loaded {len(df)} posts for @{profile.get('username')}")
+            else:
+                st.warning("No posts found for this account.")
+
+        except TwoFactorRequired:
+            st.session_state["awaiting_2fa"] = True
+            st.session_state["pending_username"] = uname
+            st.session_state["pending_password"] = pwd
+            st.rerun()
+        except BadPassword:
+            st.error("Incorrect password. Please try again.")
+        except ChallengeRequired:
+            st.error(
+                "Instagram is asking for a security challenge (SMS or email verification). "
+                "Log in to Instagram in a browser first to clear the challenge, then retry here."
+            )
+        except LoginRequired:
+            st.error("Session expired. Please log in again.")
+        except Exception as e:
+            st.error(f"Login failed: {e}")
+
+    if connect and username and password:
+        with st.spinner("Connecting to Instagram…"):
+            _do_login(username, password)
+
+    if verify and code:
+        uname = st.session_state.get("pending_username", username)
+        pwd = st.session_state.get("pending_password", password)
+        with st.spinner("Verifying 2FA code…"):
+            _do_login(uname, pwd, otp=code)
 
     df: pd.DataFrame | None = st.session_state.get("df")
     profile: dict = st.session_state.get("profile", {})
-    s_token: str = st.session_state.get("token", token)
-    s_uid: str = st.session_state.get("user_id", user_id)
 
     if df is None or df.empty:
         st.markdown(
@@ -1092,7 +1103,7 @@ def main() -> None:
     with tabs[4]:
         render_recommendations(df, profile)
     with tabs[5]:
-        render_audience_insights(s_token, s_uid, profile)
+        render_audience_insights(profile, df)
     with tabs[6]:
         render_export(df, profile)
 
