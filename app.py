@@ -71,12 +71,14 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str]:
     Returns (accounts, diagnostic) where accounts is a list of dicts with
     keys ig_user_id, ig_username, page_name, and diagnostic is a human-readable
     string explaining what was found / what went wrong.
+
+    Key detail: instagram_business_account must be fetched using the Page's own
+    Access Token, not the User Access Token — meta/accounts returns both.
     """
     accounts: list[dict] = []
     try:
-        # Request instagram_business_account as a plain field (no nested sub-fields)
-        # — nested syntax can silently return empty on some token types.
-        data = _graph_get("me/accounts", token, fields="id,name,instagram_business_account")
+        # include access_token so we can re-request with the Page token below
+        data = _graph_get("me/accounts", token, fields="id,name,access_token")
         pages = data.get("data", [])
 
         if not pages:
@@ -89,18 +91,35 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str]:
             )
 
         page_names = [p.get("name", p.get("id", "?")) for p in pages]
-        pages_without_ig = []
 
         for page in pages:
-            raw_iba = page.get("instagram_business_account")
-            # raw_iba is either {"id": "..."} or None / missing
-            ig_id = (raw_iba or {}).get("id") if isinstance(raw_iba, dict) else None
+            page_id = page["id"]
+            page_name = page.get("name", page_id)
+            # Use the Page Access Token — this is required for instagram_business_account
+            page_token = page.get("access_token") or token
+
+            ig_id = None
+
+            # Primary: instagram_business_account (Business + Creator accounts)
+            try:
+                pd_ = _graph_get(page_id, page_token, fields="instagram_business_account")
+                raw = pd_.get("instagram_business_account")
+                ig_id = raw.get("id") if isinstance(raw, dict) else None
+            except Exception:
+                pass
+
+            # Fallback: connected_instagram_account (catches some Creator setups)
+            if not ig_id:
+                try:
+                    pd_ = _graph_get(page_id, page_token, fields="connected_instagram_account")
+                    raw = pd_.get("connected_instagram_account")
+                    ig_id = raw.get("id") if isinstance(raw, dict) else None
+                except Exception:
+                    pass
 
             if not ig_id:
-                pages_without_ig.append(page.get("name", page.get("id", "?")))
                 continue
 
-            # Fetch IG username separately to avoid nested field issues
             try:
                 ig_info = _graph_get_fields(ig_id, token, fields=["username", "name"])
             except Exception:
@@ -110,22 +129,23 @@ def find_ig_accounts(token: str) -> tuple[list[dict], str]:
                 "ig_user_id": ig_id,
                 "ig_username": ig_info.get("username", ""),
                 "ig_name": ig_info.get("name", ""),
-                "page_name": page.get("name", ""),
+                "page_name": page_name,
             })
 
         if not accounts:
             names = ", ".join(f'**{n}**' for n in page_names[:5])
             return [], (
-                f"Found {len(pages)} Facebook Page(s) ({names}) but the "
-                "`instagram_business_account` field was empty for all of them.\n\n"
-                "**Most likely causes:**\n"
-                "1. Your Instagram account is still in **Personal** mode — go to "
-                "Instagram app → **Settings → Account → Switch to Professional Account**\n"
-                "2. The Page–Instagram link is incomplete — open **Meta Business Suite** "
-                "(business.facebook.com), go to **Settings → Instagram accounts** and "
-                "confirm the account appears there\n"
-                "3. Your token is missing `pages_read_engagement` permission — regenerate "
-                "it with that permission checked"
+                f"Found {len(pages)} Facebook Page(s) ({names}) but could not find "
+                "a linked Instagram account via either `instagram_business_account` "
+                "or `connected_instagram_account`.\n\n"
+                "**Steps to fix:**\n"
+                "1. In Instagram app: **Settings → Account → Switch to Professional Account** "
+                "(Creator or Business)\n"
+                "2. In Instagram app: **Settings → Account → Sharing to other apps → Facebook** "
+                "— link to your Page\n"
+                "3. Confirm in **Meta Business Suite** (business.facebook.com) → "
+                "**Settings → Instagram accounts** that your account is listed\n"
+                "4. Regenerate your token with `instagram_basic` and `pages_read_engagement` checked"
             )
 
         return accounts, ""
